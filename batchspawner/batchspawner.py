@@ -16,23 +16,30 @@ Common attributes of batch submission / resource manager environments will inclu
   * job names instead of PIDs
 """
 import asyncio
-from async_generator import async_generator, yield_
 import pwd
 import os
 import re
-
-import xml.etree.ElementTree as ET
-
+import tempfile
+import pathlib
+import json
 from enum import Enum
+from contextlib import contextmanager
+
+from async_generator import async_generator, yield_
 
 from jinja2 import Template
 
 from tornado import gen
+from tornado.httpclient import AsyncHTTPClient, HTTPClientError, HTTPRequest
 
 from jupyterhub.spawner import Spawner
+from jupyterhub.spawner import set_user_setuid
+from jupyterhub.utils import random_port
 from traitlets import Integer, Unicode, Float, Dict, default
 
-from jupyterhub.spawner import set_user_setuid
+from cryptography.hazmat.primitives import serialization as crypto_serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.backends import default_backend as crypto_default_backend
 
 
 def format_template(template, *args, **kwargs):
@@ -44,9 +51,33 @@ def format_template(template, *args, **kwargs):
     """
     if isinstance(template, Template):
         return template.render(*args, **kwargs)
-    elif "{{" in template or "{%" in template:
+    if "{{" in template or "{%" in template:
         return Template(template).render(*args, **kwargs)
     return template.format(*args, **kwargs)
+
+
+def dump_to_rdonly_file(path, content: bytes):
+    """Create read-only file and write content to it"""
+    flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC
+    fd = os.open(path, flags=flags, mode=0o400)
+    os.write(fd, content)
+    os.close(fd)
+
+@contextmanager
+def tempkey(key: str, cert: str, login: str):
+    """Create temporary directory for key and cert with name based on login"""
+    tmpdir = tempfile.TemporaryDirectory(prefix=f'.ssh_{login}_')
+
+    dirpath = pathlib.Path(tmpdir.name)
+
+    keypath = dirpath / 'key'
+    dump_to_rdonly_file(keypath, key.encode('utf-8'))
+    dump_to_rdonly_file(dirpath / 'key-cert.pub', cert.encode('utf-8'))
+
+    try:
+        yield keypath.absolute()
+    finally:
+        tmpdir.cleanup()
 
 
 class JobStatus(Enum):
@@ -87,7 +118,7 @@ class BatchSpawnerBase(Spawner):
     ).tag(config=True)
 
     exec_prefix = Unicode(
-        "sudo -E -u {username}",
+        "",
         help="Standard executon prefix (e.g. the default sudo -E -u {username})",
     ).tag(config=True)
 
@@ -180,7 +211,7 @@ class BatchSpawnerBase(Spawner):
     ).tag(config=True)
 
     batchspawner_singleuser_cmd = Unicode(
-        "batchspawner-singleuser",
+        "",
         help="A wrapper which is capable of special batchspawner setup: currently sets the port on "
         "the remote host.  Not needed to be set under normal circumstances, unless path needs "
         "specification.",
@@ -191,6 +222,17 @@ class BatchSpawnerBase(Spawner):
 
     # Will get the raw output of the job status command unless overridden
     job_status = Unicode()
+
+    hub_connect_hostname = Unicode(
+        "",
+        help="Hostname of hub",
+    ).tag(config=True)
+
+    hub_connect_protocol = Unicode(
+        "https",
+        help="Protocol to connect to hub",
+    ).tag(config=True)
+
 
     # Prepare substitution variables for templates using req_xyz traits
     def get_req_subvars(self):
@@ -207,6 +249,7 @@ class BatchSpawnerBase(Spawner):
         help="Command to run to submit batch scripts. Formatted using req_xyz traits as {xyz}.",
     ).tag(config=True)
 
+
     def parse_job_id(self, output):
         "Parse output of submit command to get job id."
         return output
@@ -216,57 +259,70 @@ class BatchSpawnerBase(Spawner):
         return " ".join([self.batchspawner_singleuser_cmd] + self.cmd + self.get_args())
 
     async def run_command(self, cmd, input=None, env=None):
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            env=env,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        inbytes = None
+        env_string = ''
+        # TODO: add env variable copying
+        with tempkey(self.ssh_private_key, self.ssh_cert, self.user.name) as keypath:
+            ssh_cmd = ' '.join([
+                'ssh',
+                f'-i {str(keypath.absolute())}',
+                '-o LogLevel=error',
+                '-o StrictHostKeyChecking=no',
+                '-o PasswordAuthentication=no',
+                f'{self.user.name}@{self.req_host}',
+                f'" {env_string} {cmd} "'
+            ])
+            proc = await asyncio.create_subprocess_shell(
+                ssh_cmd,
+                env=env,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            inbytes = None
 
-        if input:
-            inbytes = input.encode()
+            if input:
+                inbytes = input.encode()
 
-        try:
-            out, eout = await proc.communicate(input=inbytes)
-        except:
-            self.log.debug("Exception raised when trying to run command: %s" % cmd)
-            proc.kill()
-            self.log.debug("Running command failed, killed process.")
             try:
-                out, eout = await asyncio.wait_for(proc.communicate(), timeout=2)
-                out = out.decode().strip()
-                eout = eout.decode().strip()
-                self.log.error("Subprocess returned exitcode %s" % proc.returncode)
-                self.log.error("Stdout:")
-                self.log.error(out)
-                self.log.error("Stderr:")
-                self.log.error(eout)
-                raise RuntimeError(
-                    "{} exit status {}: {}".format(cmd, proc.returncode, eout)
-                )
-            except asyncio.TimeoutError:
-                self.log.error(
-                    "Encountered timeout trying to clean up command, process probably killed already: %s"
-                    % cmd
-                )
-                return ""
+                out, eout = await proc.communicate(input=inbytes)
             except:
-                self.log.error(
-                    "Encountered exception trying to clean up command: %s" % cmd
-                )
-                raise
-        else:
-            eout = eout.decode().strip()
-            err = proc.returncode
-            if err != 0:
-                self.log.error("Subprocess returned exitcode %s" % err)
-                self.log.error(eout)
-                raise RuntimeError(eout)
+                self.log.debug("Exception raised when trying to run command: %s" % cmd)
+                proc.kill()
+                self.log.debug("Running command failed, killed process.")
+                try:
+                    out, eout = await asyncio.wait_for(proc.communicate(), timeout=2)
+                    out = out.decode().strip()
+                    eout = eout.decode().strip()
+                    self.log.error("Subprocess returned exitcode %s" % proc.returncode)
+                    self.log.error("Stdout:")
+                    self.log.error(out)
+                    self.log.error("Stderr:")
+                    self.log.error(eout)
+                    raise RuntimeError(
+                        "{} exit status {}: {}".format(cmd, proc.returncode, eout)
+                    )
+                except asyncio.TimeoutError:
+                    self.log.error(
+                        "Encountered timeout trying to clean up command,"
+                        " process probably killed already: %s"
+                        % cmd
+                    )
+                    return ""
+                except:
+                    self.log.error(
+                        "Encountered exception trying to clean up command: %s" % cmd
+                    )
+                    raise
+            else:
+                eout = eout.decode().strip()
+                err = proc.returncode
+                if err != 0:
+                    self.log.error("Subprocess returned exitcode %s" % err)
+                    self.log.error(eout)
+                    raise RuntimeError(eout)
 
-        out = out.decode().strip()
-        return out
+            out = out.decode().strip()
+            return out
 
     async def _get_batch_script(self, **subvars):
         """Format batch script from vars"""
@@ -275,6 +331,11 @@ class BatchSpawnerBase(Spawner):
 
     async def submit_batch_script(self):
         subvars = self.get_req_subvars()
+        subvars['env'] = self._prepare_env_string()
+        subvars['localport'] = self.port
+        subvars['sish_private_key'] = self.sish_private_bytes.decode()
+        subvars['hub_hostname'] = self.hub_connect_hostname
+
         # `cmd` is submitted to the batch system
         cmd = " ".join(
             (
@@ -290,7 +351,7 @@ class BatchSpawnerBase(Spawner):
         script = await self._get_batch_script(**subvars)
         self.log.info("Spawner submitting job using " + cmd)
         self.log.info("Spawner submitted script:\n" + script)
-        out = await self.run_command(cmd, input=script, env=self.get_env())
+        out = await self.run_command(cmd, input=script)
         try:
             self.log.info("Job submitted. cmd: " + cmd + " output: " + out)
             self.job_id = self.parse_job_id(out)
@@ -298,6 +359,26 @@ class BatchSpawnerBase(Spawner):
             self.log.error("Job submission failed with exit code " + out)
             self.job_id = ""
         return self.job_id
+
+    def _prepare_env_string(self):
+        env = self.get_env()
+
+        if self.hub_connect_hostname:
+            base_url = self.hub_connect_protocol + '://' + self.hub_connect_hostname
+        else:
+            base_url = self.ip
+        
+        username = self.user.name
+        env['JUPYTERHUB_API_URL'] = '/'.join([base_url, '/hub/api'])
+        env['JUPYTERHUB_ACTIVITY_URL'] = '/'.join([base_url, '/hub/api/users/' + username + '/activity'])
+
+        envs = []
+        for key in env:
+            if key.startswith('JUPYTER') or key.startswith('JPY') or key == 'ACCESS_TOKEN':
+                value = f"export {key}='{env[key]}'"
+                envs.append(value)
+        return '\n'.join(envs)
+
 
     # Override if your batch system needs something more elaborate to query the job status
     batch_query_cmd = Unicode(
@@ -406,19 +487,18 @@ class BatchSpawnerBase(Spawner):
             return 1
 
     startup_poll_interval = Float(
-        0.5,
+        10,
         help="Polling interval (seconds) to check job state during startup",
     ).tag(config=True)
 
     async def start(self):
         """Start the process"""
         self.ip = self.traits()["ip"].default_value
-        self.port = self.traits()["port"].default_value
-
+        self.port = random_port()
         if self.server:
             self.server.port = self.port
 
-        job = await self.submit_batch_script()
+        await self.submit_batch_script()
 
         # We are called with a timeout, and if the timeout expires this function will
         # be interrupted at the next yield, and self.stop() will be called.
@@ -451,13 +531,9 @@ class BatchSpawnerBase(Spawner):
                 )
             await gen.sleep(self.startup_poll_interval)
 
-        self.ip = self.state_gethost()
-        while self.port == 0:
-            await gen.sleep(self.startup_poll_interval)
-            # Test framework: For testing, mock_port is set because we
-            # don't actually run the single-user server yet.
-            if hasattr(self, "mock_port"):
-                self.port = self.mock_port
+
+        self.ip = 'localhost'
+        self.log.debug(f'ip={self.ip}, port={self.port}')
 
         self.db.commit()
         self.log.info(
@@ -587,86 +663,20 @@ class BatchSpawnerRegexStates(BatchSpawnerBase):
             return match.expand(self.state_exechost_exp)
 
 
-class TorqueSpawner(BatchSpawnerRegexStates):
-    batch_script = Unicode(
-        """#!/bin/sh
-#PBS -q {queue}@{host}
-#PBS -l walltime={runtime}
-#PBS -l nodes=1:ppn={nprocs}
-#PBS -l mem={memory}
-#PBS -N jupyterhub-singleuser
-#PBS -v {keepvars}
-#PBS {options}
-
-set -eu
-
-{prologue}
-{cmd}
-{epilogue}
-"""
-    ).tag(config=True)
-
-    # outputs job id string
-    batch_submit_cmd = Unicode("qsub").tag(config=True)
-    # outputs job data XML string
-    batch_query_cmd = Unicode("qstat -x {job_id}").tag(config=True)
-    batch_cancel_cmd = Unicode("qdel {job_id}").tag(config=True)
-    # search XML string for job_state - [QH] = pending, R = running, [CE] = done
-    state_pending_re = Unicode(r"<job_state>[QH]</job_state>").tag(config=True)
-    state_running_re = Unicode(r"<job_state>R</job_state>").tag(config=True)
-    state_exechost_re = Unicode(r"<exec_host>((?:[\w_-]+\.?)+)/\d+").tag(config=True)
-
-
-class MoabSpawner(TorqueSpawner):
-    # outputs job id string
-    batch_submit_cmd = Unicode("msub").tag(config=True)
-    # outputs job data XML string
-    batch_query_cmd = Unicode("mdiag -j {job_id} --xml").tag(config=True)
-    batch_cancel_cmd = Unicode("mjobctl -c {job_id}").tag(config=True)
-    state_pending_re = Unicode(r'State="Idle"').tag(config=True)
-    state_running_re = Unicode(r'State="Running"').tag(config=True)
-    state_exechost_re = Unicode(r'AllocNodeList="([^\r\n\t\f :"]*)').tag(config=True)
-
-
-class PBSSpawner(TorqueSpawner):
-    batch_script = Unicode(
-        """#!/bin/sh
-{% if queue or host %}#PBS -q {% if queue  %}{{queue}}{% endif %}\
-{% if host %}@{{host}}{% endif %}{% endif %}
-#PBS -l walltime={{runtime}}
-#PBS -l select=1:ncpus={{nprocs}}:mem={{memory}}
-#PBS -N jupyterhub-singleuser
-#PBS -o {{homedir}}/.jupyterhub.pbs.out
-#PBS -e {{homedir}}/.jupyterhub.pbs.err
-#PBS -v {{keepvars}}
-{% if options %}#PBS {{options}}{% endif %}
-
-set -eu
-
-{{prologue}}
-{{cmd}}
-{{epilogue}}
-"""
-    ).tag(config=True)
-
-    # outputs job data XML string
-    batch_query_cmd = Unicode("qstat -fx {job_id}").tag(config=True)
-
-    state_pending_re = Unicode(r"job_state = [QH]").tag(config=True)
-    state_running_re = Unicode(r"job_state = R").tag(config=True)
-    state_exechost_re = Unicode(r"exec_host = ([\w_-]+)/").tag(config=True)
-
-
 class UserEnvMixin:
     """Mixin class that computes values for USER, SHELL and HOME in the environment passed to
-    the job submission subprocess in case the batch system needs these for the batch script.
-    """
+    the job submission subprocess in case the batch system needs these for the batch script."""
 
     def user_env(self, env):
         """get user environment"""
         env["USER"] = self.user.name
-        home = pwd.getpwnam(self.user.name).pw_dir
-        shell = pwd.getpwnam(self.user.name).pw_shell
+        home = False
+        shell = False
+        try:
+            home = pwd.getpwnam(self.user.name).pw_dir
+            shell = pwd.getpwnam(self.user.name).pw_shell
+        except KeyError:
+            pass
         if home:
             env["HOME"] = home
         if shell:
@@ -689,10 +699,8 @@ class UserEnvMixin:
 class SlurmSpawner(UserEnvMixin, BatchSpawnerRegexStates):
     batch_script = Unicode(
         """#!/bin/bash
-#SBATCH --output={{homedir}}/jupyterhub_slurmspawner_%j.log
+#SBATCH --output=.jupyterhub/logs/jupyterhub_slurmspawner_%j.log
 #SBATCH --job-name=spawner-jupyterhub
-#SBATCH --chdir={{homedir}}
-#SBATCH --export={{keepvars}}
 #SBATCH --get-user-env=L
 {% if partition  %}#SBATCH --partition={{partition}}
 {% endif %}{% if runtime    %}#SBATCH --time={{runtime}}
@@ -701,12 +709,33 @@ class SlurmSpawner(UserEnvMixin, BatchSpawnerRegexStates):
 {% endif %}{% if nprocs     %}#SBATCH --cpus-per-task={{nprocs}}
 {% endif %}{% if reservation%}#SBATCH --reservation={{reservation}}
 {% endif %}{% if options    %}#SBATCH {{options}}{% endif %}
-
+set -x
 set -euo pipefail
 
 trap 'echo SIGTERM received' TERM
+
+localport={{localport}}
+ipnport=$(shuf -i8000-9999 -n1)
+sish_key_path=~/.jupyterhub/sish_key
+sish_outfile=~/.jupyterhub/jupyterhub_sish_client_logs
+hub_hostname={{hub_hostname}}
+(
+    rm -f $sish_key_path
+    cat << EOF > $sish_key_path
+{{sish_private_key}}
+EOF
+    chmod 400 $sish_key_path
+    echo "Local=$localport" > $sish_outfile;
+    echo "Server=$ipnport" >> $sish_outfile;
+    ssh -p 8080 -i $sish_key_path -T \
+                -o LogLevel=error \
+                -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+            -R $localport:localhost:$ipnport $hub_hostname >> $sish_outfile 2>&1
+) &
+
+{{env}}
 {{prologue}}
-which jupyterhub-singleuser
 {% if srun %}{{srun}} {% endif %}{{cmd}}
 echo "jupyterhub-singleuser ended gracefully"
 {{epilogue}}
@@ -755,6 +784,21 @@ echo "jupyterhub-singleuser ended gracefully"
     ).tag(config=True)
     state_exechost_re = Unicode(r"\s+((?:[\w_-]+\.?)+)$").tag(config=True)
 
+    ssh_key_cert_url = Unicode(
+        "",
+        help="Token for cert exchanger url",
+    ).tag(config=True)
+
+    sish_sshkey_bits = Integer(4096).tag(config=True)
+
+    sish_public_key_path = Unicode(
+        "",
+        help="Path to sish public key directory",
+    ).tag(config=True)
+
+    keygen_public_exponent = Integer(65537).tag(config=True)
+
+
     def parse_job_id(self, output):
         # make sure jobid is really a number
         try:
@@ -766,6 +810,132 @@ echo "jupyterhub-singleuser ended gracefully"
             self.log.error("SlurmSpawner unable to parse job ID from text: " + output)
             raise e
         return id
+
+    async def start(self):
+        await self.get_key_and_cert()
+        private, public = self.sshkeygen()
+        self.sish_private_bytes = private
+        self.save_pubkey(public)
+
+        await self.run_command('[ -d ~/.jupyterhub/logs ] || mkdir -p ~/.jupyterhub/logs')
+        self.req_runtime = self.user_options.get('time', self.req_runtime)
+        self.req_partition = self.user_options.get('partition', self.req_partition)
+        grant_name = self.user_options.get('grant', '')
+        if grant_name:
+            self.req_options = f'--account={grant_name}'
+
+        self.log.debug(f'{self.req_runtime=}')
+        self.log.debug(f'{self.req_partition=}')
+        self.log.debug(f'{self.req_options=}')
+
+        ip, port = await super().start()
+        return ip, port
+
+    async def get_key_and_cert(self):
+        headers = {
+                'Authorization': f"Bearer {self.environment['ACCESS_TOKEN']}"
+        }
+
+        try:
+            req = HTTPRequest(self.ssh_key_cert_url, method="GET", headers=headers)
+            resp = await AsyncHTTPClient().fetch(req)
+            data = json.loads(resp.body.decode('utf-8'))
+            self.ssh_private_key = data['private']
+            self.ssh_cert = data['cert']
+        except HTTPClientError as e:
+            self.log.debug(e)
+            self.log.debug(f"Failure during authorization.")
+
+    def sshkeygen(self):
+        key = rsa.generate_private_key(
+            backend=crypto_default_backend(),
+            public_exponent=self.keygen_public_exponent,
+            key_size=self.sish_sshkey_bits
+        )
+
+        private_bytes = key.private_bytes(
+            crypto_serialization.Encoding.PEM,
+            crypto_serialization.PrivateFormat.OpenSSH,
+            crypto_serialization.NoEncryption()
+        )
+
+        public_bytes = key.public_key().public_bytes(
+            crypto_serialization.Encoding.OpenSSH,
+            crypto_serialization.PublicFormat.OpenSSH
+        )
+
+        return private_bytes, public_bytes
+
+    def save_pubkey(self, pubkey):
+        name = self.user.name
+        path = pathlib.Path(self.sish_public_key_path) / name
+        dump_to_rdonly_file(path, pubkey)
+
+    def _options_form_default(self):
+        return """
+        <div class="form-group">
+            <label for="time">Job limit time</label>
+            <input class="form-control" type="text" name="time" value="{time}">
+            </input>
+        </div>
+        <div class="form-group">
+            <label for="partition">Partition name</label>
+            <input class="form-control" type="partition" name="partition" value="{partition}">
+            </input>
+        </div>
+        <div class="form-group">
+            <label for="grant">Grant name</label>
+            <input class="form-control" type="grant" name="grant" value="{grant}">
+            </input>
+        </div>
+        """.format(
+            time=self.req_runtime,
+            partition=self.req_partition,
+            grant='',
+        )
+
+    def options_from_form(self, formdata):
+        options = {}
+        options['time'] = formdata.get('time', '')[0]
+        options['partition'] = formdata.get('partition', '')[0]
+        options['grant'] = formdata.get('grant', '')[0]
+
+        if not self.is_time_valid(options['time']):
+            raise ValueError(f"Invalid limit time: {options['time']}")
+
+        if options['grant'] != '' and not self.is_grant_valid(options['grant']):
+            raise ValueError(f"Invalid grant: {options['grant']}")
+
+        if options['partition'] != '' and not self.is_partition_valid(options['partition']):
+            raise ValueError(f"Invalid partition: {options['partition']}")
+        return options
+
+    @staticmethod
+    def is_time_valid(time_str: str):
+        """
+        Slurm valid time formats are:
+         * minutes
+         * minutes:seconds
+         * hours:minutes:seconds
+         * days-hours
+         * days-hours:minutes
+         * days-hours:minutes:seconds".
+
+        Only format is validated, not values.
+        """
+        p = re.compile('\d+((:\d+(:\d+)?)|(-\d+(:\d+(:\d+)?)?))?')
+        return p.fullmatch(time_str) is not None
+
+    @staticmethod
+    def is_grant_valid(grant_name: str):
+        p = re.compile('plg[a-zA-Z0-9\-]+')
+        return p.fullmatch(grant_name) is not None
+
+    @staticmethod
+    def is_partition_valid(partition_name: str):
+        p = re.compile('plg[a-zA-Z0-9\-]+')
+        return p.fullmatch(partition_name) is not None
+
 
 
 class MultiSlurmSpawner(SlurmSpawner):
@@ -783,201 +953,5 @@ class MultiSlurmSpawner(SlurmSpawner):
     def state_gethost(self):
         host = SlurmSpawner.state_gethost(self)
         return self.daemon_resolver.get(host, host)
-
-
-class GridengineSpawner(BatchSpawnerBase):
-    batch_script = Unicode(
-        """#!/bin/bash
-#$ -j yes
-#$ -N spawner-jupyterhub
-#$ -o {homedir}/.jupyterhub.sge.out
-#$ -e {homedir}/.jupyterhub.sge.err
-#$ -v {keepvars}
-#$ {options}
-
-set -euo pipefail
-
-{prologue}
-{cmd}
-{epilogue}
-"""
-    ).tag(config=True)
-
-    # outputs job id string
-    batch_submit_cmd = Unicode("qsub").tag(config=True)
-    # outputs job data XML string
-    batch_query_cmd = Unicode("qstat -xml").tag(config=True)
-    batch_cancel_cmd = Unicode("qdel {job_id}").tag(config=True)
-
-    def parse_job_id(self, output):
-        return output.split(" ")[2]
-
-    def state_ispending(self):
-        if self.job_status:
-            job_info = ET.fromstring(self.job_status).find(
-                ".//job_list[JB_job_number='{0}']".format(self.job_id)
-            )
-            if job_info is not None:
-                return job_info.attrib.get("state") == "pending"
-        return False
-
-    def state_isrunning(self):
-        if self.job_status:
-            job_info = ET.fromstring(self.job_status).find(
-                ".//job_list[JB_job_number='{0}']".format(self.job_id)
-            )
-            if job_info is not None:
-                return job_info.attrib.get("state") == "running"
-        return False
-
-    def state_gethost(self):
-        if self.job_status:
-            queue_name = ET.fromstring(self.job_status).find(
-                ".//job_list[JB_job_number='{0}']/queue_name".format(self.job_id)
-            )
-            if queue_name is not None and queue_name.text:
-                return queue_name.text.split("@")[1]
-
-        self.log.error(
-            "Spawner unable to match host addr in job {0} with status {1}".format(
-                self.job_id, self.job_status
-            )
-        )
-        return
-
-    def get_env(self):
-        env = super().get_env()
-
-        # SGE relies on environment variables to launch local jobs.  Ensure that these values are included
-        # in the environment used to run the spawner.
-        for key in [
-            "SGE_CELL",
-            "SGE_EXECD",
-            "SGE_ROOT",
-            "SGE_CLUSTER_NAME",
-            "SGE_QMASTER_PORT",
-            "SGE_EXECD_PORT",
-            "PATH",
-        ]:
-            if key in os.environ and key not in env:
-                env[key] = os.environ[key]
-        return env
-
-
-class CondorSpawner(UserEnvMixin, BatchSpawnerRegexStates):
-    batch_script = Unicode(
-        """
-Executable = /bin/sh
-RequestMemory = {memory}
-RequestCpus = {nprocs}
-Arguments = \"-c 'exec {cmd}'\"
-Remote_Initialdir = {homedir}
-Output = {homedir}/.jupyterhub.condor.out
-Error = {homedir}/.jupyterhub.condor.err
-ShouldTransferFiles = False
-GetEnv = True
-{options}
-Queue
-"""
-    ).tag(config=True)
-
-    # outputs job id string
-    batch_submit_cmd = Unicode("condor_submit").tag(config=True)
-    # outputs job data XML string
-    batch_query_cmd = Unicode(
-        'condor_q {job_id} -format "%s, " JobStatus -format "%s" RemoteHost -format "\n" True'
-    ).tag(config=True)
-    batch_cancel_cmd = Unicode("condor_rm {job_id}").tag(config=True)
-    # job status: 1 = pending, 2 = running
-    state_pending_re = Unicode(r"^1,").tag(config=True)
-    state_running_re = Unicode(r"^2,").tag(config=True)
-    state_exechost_re = Unicode(r"^\w*, .*@([^ ]*)").tag(config=True)
-
-    def parse_job_id(self, output):
-        match = re.search(r".*submitted to cluster ([0-9]+)", output)
-        if match:
-            return match.groups()[0]
-
-        error_msg = "CondorSpawner unable to parse jobID from text: " + output
-        self.log.error(error_msg)
-        raise Exception(error_msg)
-
-    def cmd_formatted_for_batch(self):
-        return (
-            super(CondorSpawner, self)
-            .cmd_formatted_for_batch()
-            .replace('"', '""')
-            .replace("'", "''")
-        )
-
-
-class LsfSpawner(BatchSpawnerBase):
-    """A Spawner that uses IBM's Platform Load Sharing Facility (LSF) to launch notebooks."""
-
-    batch_script = Unicode(
-        """#!/bin/sh
-#BSUB -R "select[type==any]"    # Allow spawning on non-uniform hardware
-#BSUB -R "span[hosts=1]"        # Only spawn job on one server
-#BSUB -q {queue}
-#BSUB -J spawner-jupyterhub
-#BSUB -o {homedir}/.jupyterhub.lsf.out
-#BSUB -e {homedir}/.jupyterhub.lsf.err
-
-set -eu
-
-{prologue}
-{cmd}
-{epilogue}
-"""
-    ).tag(config=True)
-
-    batch_submit_cmd = Unicode("bsub").tag(config=True)
-    batch_query_cmd = Unicode('bjobs -a -noheader -o "STAT EXEC_HOST" {job_id}').tag(
-        config=True
-    )
-    batch_cancel_cmd = Unicode("bkill {job_id}").tag(config=True)
-
-    def get_env(self):
-        env = super().get_env()
-
-        # LSF relies on environment variables to launch local jobs.  Ensure that these values are included
-        # in the environment used to run the spawner.
-        for key in [
-            "LSF_ENVDIR",
-            "LSF_SERVERDIR",
-            "LSF_FULL_VERSION",
-            "LSF_LIBDIR",
-            "LSF_BINDIR",
-        ]:
-            if key in os.environ and key not in env:
-                env[key] = os.environ[key]
-        return env
-
-    def parse_job_id(self, output):
-        # Assumes output in the following form:
-        # "Job <1815> is submitted to default queue <normal>."
-        return output.split(" ")[1].strip("<>")
-
-    def state_ispending(self):
-        # Parse results of batch_query_cmd
-        # Output determined by results of self.batch_query_cmd
-        if self.job_status:
-            return self.job_status.split(" ")[0].upper() in {"PEND", "PUSP"}
-
-    def state_isrunning(self):
-        if self.job_status:
-            return self.job_status.split(" ")[0].upper() == "RUN"
-
-    def state_gethost(self):
-        if self.job_status:
-            return self.job_status.split(" ")[1].strip().split(":")[0]
-
-        self.log.error(
-            "Spawner unable to match host addr in job {0} with status {1}".format(
-                self.job_id, self.job_status
-            )
-        )
-        return
-
 
 # vim: set ai expandtab softtabstop=4:
